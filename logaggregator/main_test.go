@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/discoverd/testutil"
+	"github.com/flynn/flynn/discoverd/testutil/etcdrunner"
 	"github.com/flynn/flynn/logaggregator/client"
 	"github.com/flynn/flynn/pkg/syslog/rfc5424"
 
@@ -18,34 +21,62 @@ import (
 func Test(t *testing.T) { TestingT(t) }
 
 type LogAggregatorTestSuite struct {
-	agg    *Aggregator
-	api    *httptest.Server
-	client client.Client
+	srv     *Server
+	agg     *Aggregator
+	api     *httptest.Server
+	client  client.Client
+	cleanup func()
+	dc      *discoverd.Client
 }
 
 var _ = Suite(&LogAggregatorTestSuite{})
 
 func (s *LogAggregatorTestSuite) SetUpTest(c *C) {
-	s.agg = NewAggregator("127.0.0.1:0")
-	s.api = httptest.NewServer(apiHandler(s.agg))
-	err := s.agg.Start()
-	c.Assert(err, IsNil)
+	etcdAddr, killEtcd := etcdrunner.RunEtcdServer(c)
+	dc, killDiscoverd := testutil.BootDiscoverd(c, "", etcdAddr)
+	s.cleanup = func() {
+		killDiscoverd()
+		killEtcd()
+	}
+
+	var err error
+	s.dc = dc
+	s.srv = testServer(c, dc)
+	s.agg = s.srv.Aggregator
+	s.api = httptest.NewServer(s.srv.api)
 	s.client, err = client.New(s.api.URL)
 	c.Assert(err, IsNil)
+
+	go s.srv.Run()
+}
+
+func testServer(c *C, dc *discoverd.Client) *Server {
+	srvConf := ServerConfig{
+		syslogAddr:      ":0",
+		replicationAddr: ":0",
+		apiAddr:         ":0",
+		serviceName:     "test-flynn-logaggregator",
+		discoverd:       dc,
+	}
+
+	srv, err := NewServer(srvConf)
+	c.Assert(err, IsNil)
+	return srv
 }
 
 func (s *LogAggregatorTestSuite) TearDownTest(c *C) {
+	s.cleanup()
 	s.api.Close()
-	s.agg.Shutdown()
+	s.srv.Shutdown()
 }
 
 func (s *LogAggregatorTestSuite) TestAggregatorListensOnAddr(c *C) {
-	ip, port, err := net.SplitHostPort(s.agg.Addr)
+	ip, port, err := net.SplitHostPort(s.srv.SyslogAddr().String())
 	c.Assert(err, IsNil)
-	c.Assert(ip, Equals, "127.0.0.1")
+	c.Assert(ip, Equals, "::")
 	c.Assert(port, Not(Equals), "0")
 
-	conn, err := net.Dial("tcp", s.agg.Addr)
+	conn, err := net.Dial("tcp", s.srv.SyslogAddr().String())
 	c.Assert(err, IsNil)
 	defer conn.Close()
 }
@@ -55,15 +86,6 @@ const (
 	sampleLogLine2 = "79 <40>1 2012-11-30T06:45:26+00:00 host app web.2 - - 25 yay this is a message!!!\n"
 )
 
-func (s *LogAggregatorTestSuite) TestAggregatorShutdown(c *C) {
-	conn, err := net.Dial("tcp", s.agg.Addr)
-	c.Assert(err, IsNil)
-	defer conn.Close()
-
-	conn.Write([]byte(sampleLogLine1))
-	s.agg.Shutdown()
-}
-
 func (s *LogAggregatorTestSuite) TestAggregatorBuffersMessages(c *C) {
 	// set up testing hook:
 	messageReceived := make(chan struct{})
@@ -72,7 +94,7 @@ func (s *LogAggregatorTestSuite) TestAggregatorBuffersMessages(c *C) {
 	}
 	defer func() { afterMessage = nil }()
 
-	conn, err := net.Dial("tcp", s.agg.Addr)
+	conn, err := net.Dial("tcp", s.srv.SyslogAddr().String())
 	c.Assert(err, IsNil)
 	defer conn.Close()
 
@@ -153,7 +175,7 @@ func (s *LogAggregatorTestSuite) TestAggregatorReadLastNAndSubscribe(c *C) {
 		defer func() { afterMessage = nil }()
 
 		delete(s.agg.buffers, "app") // reset the buffer
-		conn, err := net.Dial("tcp", s.agg.Addr)
+		conn, err := net.Dial("tcp", s.srv.SyslogAddr().String())
 		c.Assert(err, IsNil)
 		defer conn.Close()
 
