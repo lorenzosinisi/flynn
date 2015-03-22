@@ -17,6 +17,7 @@ type PostgresInfo struct {
 	Running    bool                `json:"running"`
 	SyncedInst *discoverd.Instance `json:"synced_inst"`
 	XLog       string              `json:"xlog,omitempty"`
+	UserExists bool                `json:"user_exists,omitempty"`
 	Replicas   []*Replica          `json:"replicas,omitempty"`
 }
 
