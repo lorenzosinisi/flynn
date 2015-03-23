@@ -10,6 +10,7 @@ import (
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/logaggregator/snapshot"
 	"github.com/flynn/flynn/pkg/connutil"
+	"github.com/flynn/flynn/pkg/stream"
 	"github.com/flynn/flynn/pkg/syslog/rfc5424"
 	"github.com/flynn/flynn/pkg/syslog/rfc6587"
 
@@ -23,9 +24,13 @@ type Server struct {
 	ll, rl, al net.Listener   // syslog, replication, and api listeners
 	lwg, rwg   sync.WaitGroup // syslog & replication wait groups
 
+	discd  *discoverd.Client
+	hb     discoverd.Heartbeater
+	srv    discoverd.Service
+	stream stream.Stream
+	eventc <-chan *discoverd.Event
+
 	api      http.Handler
-	discd    *discoverd.Client
-	hb       discoverd.Heartbeater
 	shutdown chan struct{}
 }
 
@@ -52,7 +57,14 @@ func NewServer(conf ServerConfig) (*Server, error) {
 		return nil, err
 	}
 
-	hb, err := conf.discoverd.AddServiceAndRegister(conf.serviceName, conf.syslogAddr)
+	eventc := make(chan *discoverd.Event)
+	srv := conf.discoverd.Service(conf.serviceName)
+	stream, err := srv.Watch(eventc)
+	if err != nil {
+		return nil, err
+	}
+
+	hb, err := conf.discoverd.AddServiceAndRegister(conf.serviceName, ll.Addr().String())
 	if err != nil {
 		return nil, err
 	}
@@ -67,14 +79,22 @@ func NewServer(conf ServerConfig) (*Server, error) {
 		rl: rl,
 		al: al,
 
+		discd:  conf.discoverd,
+		hb:     hb,
+		srv:    srv,
+		stream: stream,
+		eventc: eventc,
+
 		api:      apiHandler(a),
-		discd:    conf.discoverd,
-		hb:       hb,
 		shutdown: make(chan struct{}),
 	}, nil
 }
 
 func (s *Server) Shutdown() {
+	if err := s.stream.Close(); err != nil {
+		log15.Error("event stream shutdown error", "err", err)
+	}
+
 	// close discoverd service heartbeater
 	if err := s.hb.Close(); err != nil {
 		log15.Error("heartbeat shutdown error", "err", err)
@@ -135,6 +155,7 @@ func (s *Server) SyslogAddr() net.Addr {
 func (s *Server) Run() error {
 	go s.runSyslog()
 	go s.runReplication()
+	go s.monitorDiscoverd()
 
 	return http.Serve(s.al, s.api)
 }
@@ -209,7 +230,7 @@ func (s *Server) fillReplicationConn(conn net.Conn) {
 	// replication stream, then unpause the aggregator
 	unpause := s.Aggregator.Pause()
 	buffers := s.Aggregator.CopyBuffers()
-	msgc := s.Replicator.Register(conn.(http.CloseNotifier).CloseNotify())
+	msgc := s.Replicator.Register(conn.(connutil.CloseNotifier).CloseNotify())
 	unpause()
 
 	if err := snapshot.StreamTo(buffers, msgc, conn); err != nil {
@@ -219,4 +240,70 @@ func (s *Server) fillReplicationConn(conn net.Conn) {
 			}
 		}()
 	}
+}
+
+func (s *Server) monitorDiscoverd() {
+	var unfollowc chan struct{}
+
+	leader, err := s.srv.Leader()
+	if err != nil {
+		log15.Error("discoverd monitor error", "err", err)
+	}
+	if leader != nil {
+		if leader.Addr == s.hb.Addr() {
+			log15.Info("replication event", "status", "leader")
+			return
+		}
+		if unfollowc, err = s.follow(leader.Addr); err != nil {
+			log15.Error("replication error", "err", err)
+		}
+	}
+
+	for event := range s.eventc {
+		switch event.Kind {
+		case discoverd.EventKindLeader:
+			if unfollowc != nil {
+				close(unfollowc)
+			}
+
+			leader = event.Instance
+			if leader.Addr != s.hb.Addr() {
+				if unfollowc, err = s.follow(leader.Addr); err != nil {
+					log15.Error("replication error", "err", err)
+				} else {
+					log15.Info("replication event", "status", "follower", "leader", leader.Addr)
+				}
+			} else {
+				log15.Info("replication event", "status", "leader")
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) follow(addr string) (chan struct{}, error) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	s.Aggregator.Flush()
+
+	unfollowc := make(chan struct{})
+	go func() {
+		defer conn.Close()
+		sc := snapshot.NewScanner(conn)
+
+		for sc.Scan() {
+			select {
+			case <-unfollowc:
+				return
+			default:
+			}
+
+			s.Aggregator.Feed(sc.Message)
+		}
+	}()
+
+	return unfollowc, nil
 }

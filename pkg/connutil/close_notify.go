@@ -3,7 +3,10 @@ package connutil
 import (
 	"io"
 	"net"
+	"net/http"
 )
+
+type CloseNotifier http.CloseNotifier
 
 type closeNotifyConn struct {
 	net.Conn

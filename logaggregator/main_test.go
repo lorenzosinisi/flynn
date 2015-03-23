@@ -46,8 +46,6 @@ func (s *LogAggregatorTestSuite) SetUpTest(c *C) {
 	s.api = httptest.NewServer(s.srv.api)
 	s.client, err = client.New(s.api.URL)
 	c.Assert(err, IsNil)
-
-	go s.srv.Run()
 }
 
 func testServer(c *C, dc *discoverd.Client) *Server {
@@ -71,6 +69,8 @@ func (s *LogAggregatorTestSuite) TearDownTest(c *C) {
 }
 
 func (s *LogAggregatorTestSuite) TestAggregatorListensOnAddr(c *C) {
+	go s.srv.Run()
+
 	ip, port, err := net.SplitHostPort(s.srv.SyslogAddr().String())
 	c.Assert(err, IsNil)
 	c.Assert(ip, Equals, "::")
@@ -87,6 +87,8 @@ const (
 )
 
 func (s *LogAggregatorTestSuite) TestAggregatorBuffersMessages(c *C) {
+	go s.srv.Run()
+
 	// set up testing hook:
 	messageReceived := make(chan struct{})
 	afterMessage = func() {
@@ -166,6 +168,8 @@ func (s *LogAggregatorTestSuite) TestAggregatorBuffersMessages(c *C) {
 }
 
 func (s *LogAggregatorTestSuite) TestAggregatorReadLastNAndSubscribe(c *C) {
+	go s.srv.Run()
+
 	runTest := func(lines int, filters []filter, expectedBefore, expectedSubMsgs, unexpectedSubMsgs []string) {
 		// set up testing hook:
 		messageReceived := make(chan struct{})

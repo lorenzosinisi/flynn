@@ -163,6 +163,15 @@ func (a *Aggregator) Pause() func() {
 	}
 }
 
+func (a *Aggregator) Flush() {
+	a.bmu.Lock()
+	defer a.bmu.Unlock()
+
+	for _, buf := range a.buffers {
+		buf.Flush()
+	}
+}
+
 func (a *Aggregator) CopyBuffers() [][]*rfc5424.Message {
 	// TODO(benburkert): restructure Aggregator & ring.Buffer to avoid nested locks
 	a.bmu.Lock()
