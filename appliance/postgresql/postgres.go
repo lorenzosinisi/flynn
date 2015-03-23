@@ -49,6 +49,7 @@ type Postgres struct {
 	configVal     atomic.Value // *state.PgConfig
 	runningVal    atomic.Value // bool
 	syncedInstVal atomic.Value // *discoverd.Instance
+	readWriteVal  atomic.Value // bool
 	configApplied bool
 
 	// config options
@@ -102,6 +103,7 @@ func NewPostgres(c Config) state.Postgres {
 	p.setRunning(false)
 	p.setConfig(nil)
 	p.setSyncedInst(nil)
+	p.setReadWrite(false)
 	if p.log == nil {
 		p.log = log15.New("app", "postgres", "id", p.id)
 	}
@@ -151,11 +153,20 @@ func (p *Postgres) setSyncedInst(inst *discoverd.Instance) {
 	p.syncedInstVal.Store(inst)
 }
 
+func (p *Postgres) readWrite() bool {
+	return p.readWriteVal.Load().(bool)
+}
+
+func (p *Postgres) setReadWrite(readWrite bool) {
+	p.readWriteVal.Store(readWrite)
+}
+
 func (p *Postgres) Info() (*pgmanager.PostgresInfo, error) {
 	res := &pgmanager.PostgresInfo{
 		Config:     p.config(),
 		Running:    p.running(),
 		SyncedInst: p.syncedInst(),
+		ReadWrite:  p.readWrite(),
 	}
 	xlog, err := p.XLogPosition()
 	res.XLog = string(xlog)
@@ -728,6 +739,7 @@ func (p *Postgres) waitForSync(inst *discoverd.Instance, enableWrites bool) {
 				log.Error("error calling sighup")
 				return
 			}
+			p.setReadWrite(true)
 		}
 	}()
 }
